@@ -1,0 +1,28 @@
+# Core
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# HTTP / API
+httpx==0.28.1
+websockets==14.2
+
+# Data
+pandas==2.2.3
+
+# Dashboard
+streamlit==1.41.1
+
+# Alerts
+python-telegram-bot==21.9
+
+# Utils
+python-dotenv==1.0.1
+structlog==24.4.0
+click==8.1.8
+
+# Dev
+pytest==8.3.4
+pytest-asyncio==0.25.2
