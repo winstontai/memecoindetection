@@ -64,7 +64,11 @@ class LiveScanner:
         return signal
 
     def _parse_helius_swap(self, tx: dict, target_mint: str) -> dict | None:
-        """Parse a Helius enhanced transaction into our trade format."""
+        """Parse a Helius enhanced transaction into our trade format.
+
+        Handles multiple sources: standard DEX swaps (events.swap),
+        Meteora/Moonshot swaps (tokenTransfers), and Pump AMM swaps.
+        """
         try:
             ts = tx.get("timestamp")
             if not ts:
@@ -74,49 +78,96 @@ class LiveScanner:
             signature = tx.get("signature", "")
             fee_payer = tx.get("feePayer", "")
 
-            # Helius swap events
+            WSOL_MINT = "So11111111111111111111111111111111"
+
+            # Strategy 1: Use events.swap if available (standard DEX swaps)
             events = tx.get("events", {})
             swap = events.get("swap")
-            if not swap:
+            if swap:
+                token_inputs = swap.get("tokenInputs", [])
+                token_outputs = swap.get("tokenOutputs", [])
+                native_input = swap.get("nativeInput", {})
+                native_output = swap.get("nativeOutput", {})
+
+                is_buy = any(t.get("mint") == target_mint for t in token_outputs)
+                is_sell = any(t.get("mint") == target_mint for t in token_inputs)
+
+                if not (is_buy or is_sell):
+                    return None
+
+                sol_amount = 0
+                if is_buy and native_input:
+                    sol_amount = float(native_input.get("amount", 0)) / 1e9
+                elif is_sell and native_output:
+                    sol_amount = float(native_output.get("amount", 0)) / 1e9
+
+                token_amount = 0
+                source_list = token_outputs if is_buy else token_inputs
+                for t in source_list:
+                    if t.get("mint") == target_mint:
+                        raw = t.get("rawTokenAmount", {})
+                        token_amount = float(raw.get("tokenAmount", 0)) / (10 ** raw.get("decimals", 9))
+
+                return {
+                    "tx_signature": signature,
+                    "wallet_address": fee_payer,
+                    "token_mint": target_mint,
+                    "timestamp": timestamp,
+                    "side": "buy" if is_buy else "sell",
+                    "amount_tokens": token_amount,
+                    "amount_sol": sol_amount,
+                    "price_usd": None,
+                }
+
+            # Strategy 2: Use tokenTransfers (Meteora, Pump AMM, etc.)
+            token_transfers = tx.get("tokenTransfers", [])
+            native_transfers = tx.get("nativeTransfers", [])
+
+            if not token_transfers:
                 return None
 
-            token_inputs = swap.get("tokenInputs", [])
-            token_outputs = swap.get("tokenOutputs", [])
-            native_input = swap.get("nativeInput", {})
-            native_output = swap.get("nativeOutput", {})
+            # Find transfers of our target token
+            target_transfers = [t for t in token_transfers if t.get("mint") == target_mint]
+            if not target_transfers:
+                return None
 
-            # Determine if this is a buy or sell of the target token
-            is_buy = any(
-                t.get("mint") == target_mint for t in token_outputs
-            )
-            is_sell = any(
-                t.get("mint") == target_mint for t in token_inputs
-            )
+            # Find SOL/wSOL transfers
+            sol_transfers = [t for t in token_transfers if t.get("mint") == WSOL_MINT]
+
+            # Determine buy vs sell: if fee_payer receives the target token, it's a buy
+            is_buy = any(t.get("toUserAccount") == fee_payer for t in target_transfers)
+            is_sell = any(t.get("fromUserAccount") == fee_payer for t in target_transfers)
 
             if not (is_buy or is_sell):
+                # Check if any transfer involves the fee payer indirectly
                 return None
 
-            # Calculate SOL amount
-            sol_amount = 0
-            if is_buy and native_input:
-                sol_amount = native_input.get("amount", 0) / 1e9
-            elif is_sell and native_output:
-                sol_amount = native_output.get("amount", 0) / 1e9
-
-            # Calculate token amount
+            # Sum token amount
             token_amount = 0
-            if is_buy:
-                for t in token_outputs:
-                    if t.get("mint") == target_mint:
-                        token_amount = t.get("rawTokenAmount", {}).get("tokenAmount", 0)
-                        decimals = t.get("rawTokenAmount", {}).get("decimals", 9)
-                        token_amount = float(token_amount) / (10 ** decimals)
-            else:
-                for t in token_inputs:
-                    if t.get("mint") == target_mint:
-                        token_amount = t.get("rawTokenAmount", {}).get("tokenAmount", 0)
-                        decimals = t.get("rawTokenAmount", {}).get("decimals", 9)
-                        token_amount = float(token_amount) / (10 ** decimals)
+            for t in target_transfers:
+                amt = float(t.get("tokenAmount", 0))
+                if is_buy and t.get("toUserAccount") == fee_payer:
+                    token_amount += amt
+                elif is_sell and t.get("fromUserAccount") == fee_payer:
+                    token_amount += amt
+
+            # Sum SOL amount from wSOL transfers or native transfers
+            sol_amount = 0
+            for t in sol_transfers:
+                amt = float(t.get("tokenAmount", 0))
+                if is_buy and t.get("fromUserAccount") == fee_payer:
+                    sol_amount += amt
+                elif is_sell and t.get("toUserAccount") == fee_payer:
+                    sol_amount += amt
+
+            # Fallback: use native transfers if no wSOL found
+            if sol_amount == 0:
+                for t in native_transfers:
+                    amt = float(t.get("amount", 0)) / 1e9
+                    if is_buy and t.get("fromUserAccount") == fee_payer:
+                        sol_amount += amt
+                    elif is_sell and t.get("toUserAccount") == fee_payer:
+                        sol_amount += amt
 
             return {
                 "tx_signature": signature,
@@ -126,7 +177,7 @@ class LiveScanner:
                 "side": "buy" if is_buy else "sell",
                 "amount_tokens": token_amount,
                 "amount_sol": sol_amount,
-                "price_usd": None,  # Filled from Birdeye if needed
+                "price_usd": None,
             }
 
         except Exception as e:

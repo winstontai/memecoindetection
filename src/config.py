@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Database
-    database_url: str = "postgresql://localhost:5432/moonshot"
+    database_url: str = "sqlite:///moonshot.db"
 
     # Helius
     helius_api_key: str = ""

@@ -16,7 +16,7 @@ ENHANCED_BASE = "https://api.helius.xyz/v1"
 class HeliusClient:
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or settings.helius_api_key
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=60.0)
 
     async def get_token_transactions(
         self,
@@ -29,11 +29,10 @@ class HeliusClient:
         This is the workhorse method for historical backfill.
         Returns transactions in reverse chronological order.
         """
-        url = f"{ENHANCED_BASE}/addresses/{mint_address}/transactions"
+        url = f"{BASE_URL}/addresses/{mint_address}/transactions"
         params = {
             "api-key": self.api_key,
             "limit": limit,
-            "type": "SWAP",
         }
         if before_signature:
             params["before"] = before_signature
@@ -49,7 +48,7 @@ class HeliusClient:
         limit: int = 100,
     ) -> list[dict]:
         """Get parsed transaction history for a wallet."""
-        url = f"{ENHANCED_BASE}/addresses/{wallet_address}/transactions"
+        url = f"{BASE_URL}/addresses/{wallet_address}/transactions"
         params = {
             "api-key": self.api_key,
             "limit": limit,

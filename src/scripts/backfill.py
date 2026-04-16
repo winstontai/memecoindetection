@@ -11,7 +11,8 @@ import asyncio
 import json
 import click
 import structlog
-from datetime import datetime
+import httpx
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.db.engine import SessionLocal
@@ -29,20 +30,41 @@ def create_tables():
     log.info("database_tables_created")
 
 
-async def backfill_token(helius: HeliusClient, mint_address: str, db) -> int:
+async def backfill_token(helius: HeliusClient, mint_address: str, db,
+                         announced_at: datetime | None = None) -> int:
     """Pull all swap transactions for a token and save to database.
 
-    Returns number of trades saved.
+    Paginates backwards in time until we reach 7 days before the announcement
+    (or exhaust all transactions). Returns number of trades saved.
     """
     scanner = LiveScanner()
     all_trades = []
     last_sig = None
 
-    # Paginate through all transactions
-    while True:
-        txs = await helius.get_token_transactions(
-            mint_address, before_signature=last_sig, limit=100
-        )
+    # Calculate how far back we need to go
+    cutoff = None
+    if announced_at:
+        cutoff = announced_at - timedelta(days=7)
+
+    max_pages = 500  # Up to 50K transactions
+    page = 0
+    reached_cutoff = False
+    while page < max_pages:
+        try:
+            txs = await helius.get_token_transactions(
+                mint_address, before_signature=last_sig, limit=100
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (429, 502, 503, 504):
+                log.warning("helius_rate_limit", token=mint_address, status=e.response.status_code, page=page)
+                await asyncio.sleep(3)
+                continue
+            raise
+        except httpx.ReadTimeout:
+            log.warning("helius_timeout", token=mint_address, page=page)
+            await asyncio.sleep(3)
+            continue
+
         if not txs:
             break
 
@@ -50,10 +72,29 @@ async def backfill_token(helius: HeliusClient, mint_address: str, db) -> int:
             parsed = scanner._parse_helius_swap(tx, mint_address)
             if parsed:
                 all_trades.append(parsed)
+                # Check if we've gone far enough back
+                if cutoff and parsed["timestamp"] < cutoff:
+                    reached_cutoff = True
 
         last_sig = txs[-1].get("signature")
+        page += 1
+
+        if page % 10 == 0:
+            oldest = None
+            if all_trades:
+                oldest = min(t["timestamp"] for t in all_trades).strftime("%Y-%m-%d %H:%M")
+            log.info("backfill_page", token=mint_address[:12], page=page,
+                     trades=len(all_trades), oldest=oldest)
+
+        if reached_cutoff:
+            log.info("reached_cutoff", token=mint_address[:12], page=page, cutoff=str(cutoff))
+            break
+
         if len(txs) < 100:
             break
+
+        # Small delay to avoid rate limiting
+        await asyncio.sleep(0.3)
 
     log.info("backfill_pulled", token=mint_address, trades=len(all_trades))
 
@@ -61,7 +102,7 @@ async def backfill_token(helius: HeliusClient, mint_address: str, db) -> int:
     saved = 0
     for trade_data in all_trades:
         # Upsert wallet
-        wallet = db.query(Wallet).get(trade_data["wallet_address"])
+        wallet = db.get(Wallet,trade_data["wallet_address"])
         if not wallet:
             wallet = Wallet(
                 address=trade_data["wallet_address"],
@@ -91,7 +132,7 @@ async def backfill_token(helius: HeliusClient, mint_address: str, db) -> int:
     db.commit()
 
     # Update seconds_before_announcement for trades
-    token = db.query(Token).get(mint_address)
+    token = db.get(Token,mint_address)
     if token and token.announced_at:
         trades = db.query(Trade).filter_by(token_mint=mint_address).all()
         for trade in trades:
@@ -129,7 +170,7 @@ def main(tokens_file: str, create_db: bool):
                 mint = token_data["mint_address"]
 
                 # Upsert token record
-                token = db.query(Token).get(mint)
+                token = db.get(Token,mint)
                 if not token:
                     token = Token(
                         mint_address=mint,
@@ -143,7 +184,7 @@ def main(tokens_file: str, create_db: bool):
                     db.add(token)
                     db.commit()
 
-                saved = await backfill_token(helius, mint, db)
+                saved = await backfill_token(helius, mint, db, announced_at=token.announced_at)
                 log.info("token_backfilled", token=mint, trades_saved=saved)
 
         finally:

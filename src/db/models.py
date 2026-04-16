@@ -3,7 +3,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, String, Float, Integer, Boolean, DateTime, BigInteger,
+    Column, String, Float, Integer, Boolean, DateTime, Integer,
     ForeignKey, Index, Text, JSON
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -77,7 +77,7 @@ class Trade(Base):
     """A single trade (buy or sell) for a token by a wallet."""
     __tablename__ = "trades"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     tx_signature = Column(String(88), unique=True, nullable=False)
     wallet_address = Column(String(44), ForeignKey("wallets.address"), nullable=False)
     token_mint = Column(String(44), ForeignKey("tokens.mint_address"), nullable=False)
@@ -106,7 +106,7 @@ class WalletScore(Base):
     """Computed score for a wallet based on historical analysis."""
     __tablename__ = "wallet_scores"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     wallet_address = Column(String(44), ForeignKey("wallets.address"), nullable=False)
 
     # Component scores (0-100 each)
@@ -134,7 +134,7 @@ class TokenSignal(Base):
     """A signal generated when a new token matches patterns."""
     __tablename__ = "token_signals"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     token_mint = Column(String(44), ForeignKey("tokens.mint_address"), nullable=False)
 
     signal_type = Column(String(30), nullable=False)  # wallet_match, pattern_match, composite
@@ -166,7 +166,7 @@ class FundingLink(Base):
     """Tracks where a wallet got its SOL from (funding source analysis)."""
     __tablename__ = "funding_links"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     wallet_address = Column(String(44), ForeignKey("wallets.address"), nullable=False)
     funder_address = Column(String(44), nullable=False)
     amount_sol = Column(Float)
