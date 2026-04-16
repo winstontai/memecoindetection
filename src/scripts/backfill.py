@@ -1,10 +1,10 @@
 """Historical backfill script.
 
 Pulls trade data for a list of known tokens and populates the database.
-This is the first script you run to seed the system with historical data.
+Uses Birdeye's trade API which returns only swaps and supports offset pagination.
 
 Usage:
-    python -m src.scripts.backfill --tokens-file data/seed_tokens.json
+    python -m src.scripts.backfill --tokens-file data/seed_tokens.json --create-db
 """
 
 import asyncio
@@ -12,16 +12,17 @@ import json
 import click
 import structlog
 import httpx
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.db.engine import SessionLocal
 from src.db.models import Base, Token, Wallet, Trade
 from src.db.engine import engine
-from src.ingestion.helius import HeliusClient
-from src.monitor.live_scanner import LiveScanner
+from src.ingestion.birdeye import BirdeyeClient
 
 log = structlog.get_logger()
+
+BATCH_SIZE = 50  # Birdeye max per request
 
 
 def create_tables():
@@ -30,79 +31,100 @@ def create_tables():
     log.info("database_tables_created")
 
 
-async def backfill_token(helius: HeliusClient, mint_address: str, db,
-                         announced_at: datetime | None = None) -> int:
-    """Pull all swap transactions for a token and save to database.
+def parse_birdeye_trade(trade: dict, token_mint: str) -> dict:
+    """Convert a Birdeye trade object into our internal format."""
+    ts = datetime.fromtimestamp(trade["blockUnixTime"], tz=timezone.utc).replace(tzinfo=None)
 
-    Paginates backwards in time until we reach 7 days before the announcement
-    (or exhaust all transactions). Returns number of trades saved.
+    sol_amount = trade.get("quote", {}).get("uiAmount", 0)
+    token_amount = trade.get("base", {}).get("uiAmount", 0)
+    price_usd = trade.get("tokenPrice")
+
+    return {
+        "tx_signature": trade["txHash"],
+        "wallet_address": trade["owner"],
+        "token_mint": token_mint,
+        "timestamp": ts,
+        "side": trade["side"],
+        "amount_tokens": token_amount,
+        "amount_sol": abs(sol_amount) if sol_amount else 0,
+        "price_usd": price_usd,
+    }
+
+
+async def backfill_token(
+    birdeye: BirdeyeClient,
+    mint_address: str,
+    db,
+    announced_at: datetime | None = None,
+) -> int:
+    """Pull all swap trades for a token via Birdeye and save to database.
+
+    Uses ascending sort (oldest first) so we naturally walk from token
+    creation through announcement.
     """
-    scanner = LiveScanner()
     all_trades = []
-    last_sig = None
+    offset = 0
 
-    # Calculate how far back we need to go
-    cutoff = None
+    # We want all trades up to announcement + 24h (to capture immediate post-announcement)
+    cutoff_ts = None
     if announced_at:
-        cutoff = announced_at - timedelta(days=7)
+        cutoff_ts = announced_at + timedelta(hours=24)
 
-    max_pages = 500  # Up to 50K transactions
-    page = 0
-    reached_cutoff = False
-    while page < max_pages:
+    max_offset = 9950  # Birdeye caps at 10K offset
+    while offset <= max_offset:
         try:
-            txs = await helius.get_token_transactions(
-                mint_address, before_signature=last_sig, limit=100
+            items = await birdeye.get_token_trades(
+                mint_address, offset=offset, limit=BATCH_SIZE, sort_type="asc"
             )
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                log.info("birdeye_offset_limit", token=mint_address[:12], offset=offset)
+                break
             if e.response.status_code in (429, 502, 503, 504):
-                log.warning("helius_rate_limit", token=mint_address, status=e.response.status_code, page=page)
+                log.warning("birdeye_rate_limit", status=e.response.status_code, offset=offset)
                 await asyncio.sleep(3)
                 continue
             raise
-        except httpx.ReadTimeout:
-            log.warning("helius_timeout", token=mint_address, page=page)
+        except (httpx.ReadError, httpx.ReadTimeout, httpx.ConnectError):
+            log.warning("birdeye_network_error", token=mint_address[:12], offset=offset)
             await asyncio.sleep(3)
             continue
 
-        if not txs:
+        if not items:
             break
 
-        for tx in txs:
-            parsed = scanner._parse_helius_swap(tx, mint_address)
-            if parsed:
-                all_trades.append(parsed)
-                # Check if we've gone far enough back
-                if cutoff and parsed["timestamp"] < cutoff:
-                    reached_cutoff = True
+        reached_cutoff = False
+        for item in items:
+            parsed = parse_birdeye_trade(item, mint_address)
+            if cutoff_ts and parsed["timestamp"] > cutoff_ts:
+                reached_cutoff = True
+                break
+            all_trades.append(parsed)
 
-        last_sig = txs[-1].get("signature")
-        page += 1
+        offset += len(items)
 
-        if page % 10 == 0:
-            oldest = None
-            if all_trades:
-                oldest = min(t["timestamp"] for t in all_trades).strftime("%Y-%m-%d %H:%M")
-            log.info("backfill_page", token=mint_address[:12], page=page,
-                     trades=len(all_trades), oldest=oldest)
+        if offset % 200 == 0:
+            oldest = all_trades[0]["timestamp"].strftime("%Y-%m-%d %H:%M") if all_trades else "?"
+            newest = all_trades[-1]["timestamp"].strftime("%Y-%m-%d %H:%M") if all_trades else "?"
+            log.info("backfill_progress", token=mint_address[:12],
+                     trades=len(all_trades), range=f"{oldest} -> {newest}")
 
         if reached_cutoff:
-            log.info("reached_cutoff", token=mint_address[:12], page=page, cutoff=str(cutoff))
+            log.info("reached_cutoff", token=mint_address[:12], trades=len(all_trades))
             break
 
-        if len(txs) < 100:
+        if len(items) < BATCH_SIZE:
             break
 
-        # Small delay to avoid rate limiting
         await asyncio.sleep(0.3)
 
-    log.info("backfill_pulled", token=mint_address, trades=len(all_trades))
+    log.info("backfill_pulled", token=mint_address[:12], total_trades=len(all_trades))
 
     # Save to database
     saved = 0
     for trade_data in all_trades:
         # Upsert wallet
-        wallet = db.get(Wallet,trade_data["wallet_address"])
+        wallet = db.get(Wallet, trade_data["wallet_address"])
         if not wallet:
             wallet = Wallet(
                 address=trade_data["wallet_address"],
@@ -111,7 +133,7 @@ async def backfill_token(helius: HeliusClient, mint_address: str, db,
             )
             db.add(wallet)
 
-        # Check for duplicate trade
+        # Skip duplicates
         existing = db.query(Trade).filter_by(tx_signature=trade_data["tx_signature"]).first()
         if existing:
             continue
@@ -131,8 +153,8 @@ async def backfill_token(helius: HeliusClient, mint_address: str, db,
 
     db.commit()
 
-    # Update seconds_before_announcement for trades
-    token = db.get(Token,mint_address)
+    # Compute seconds_before_announcement for each trade
+    token = db.get(Token, mint_address)
     if token and token.announced_at:
         trades = db.query(Trade).filter_by(token_mint=mint_address).all()
         for trade in trades:
@@ -162,7 +184,7 @@ def main(tokens_file: str, create_db: bool):
     log.info("starting_backfill", token_count=len(tokens))
 
     async def run():
-        helius = HeliusClient()
+        birdeye = BirdeyeClient()
         db = SessionLocal()
 
         try:
@@ -170,7 +192,7 @@ def main(tokens_file: str, create_db: bool):
                 mint = token_data["mint_address"]
 
                 # Upsert token record
-                token = db.get(Token,mint)
+                token = db.get(Token, mint)
                 if not token:
                     token = Token(
                         mint_address=mint,
@@ -184,12 +206,12 @@ def main(tokens_file: str, create_db: bool):
                     db.add(token)
                     db.commit()
 
-                saved = await backfill_token(helius, mint, db, announced_at=token.announced_at)
-                log.info("token_backfilled", token=mint, trades_saved=saved)
+                saved = await backfill_token(birdeye, mint, db, announced_at=token.announced_at)
+                log.info("token_backfilled", token=mint[:12], symbol=token_data.get("symbol"), trades_saved=saved)
 
         finally:
             db.close()
-            await helius.close()
+            await birdeye.close()
 
     asyncio.run(run())
 

@@ -59,18 +59,23 @@ class BirdeyeClient:
         mint_address: str,
         offset: int = 0,
         limit: int = 50,
-        sort_type: str = "desc",
+        sort_type: str = "asc",
+        tx_type: str = "swap",
     ) -> list[dict]:
-        """Get recent trades for a token."""
-        resp = await self.client.get(
-            f"{BASE_URL}/defi/txs/token",
-            params={
-                "address": mint_address,
-                "offset": offset,
-                "limit": limit,
-                "sort_type": sort_type,
-            },
-        )
+        """Get trades for a token with offset pagination.
+
+        Args:
+            sort_type: "asc" for oldest first, "desc" for newest first.
+            tx_type: "swap" for swap trades only.
+        """
+        params = {
+            "address": mint_address,
+            "offset": offset,
+            "limit": limit,
+            "sort_type": sort_type,
+            "tx_type": tx_type,
+        }
+        resp = await self.client.get(f"{BASE_URL}/defi/txs/token", params=params)
         resp.raise_for_status()
         return resp.json().get("data", {}).get("items", [])
 
