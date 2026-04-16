@@ -31,13 +31,28 @@ def create_tables():
     log.info("database_tables_created")
 
 
+WSOL_ADDRESS = "So11111111111111111111111111111111111111112"
+
+
 def parse_birdeye_trade(trade: dict, token_mint: str) -> dict:
     """Convert a Birdeye trade object into our internal format."""
     ts = datetime.fromtimestamp(trade["blockUnixTime"], tz=timezone.utc).replace(tzinfo=None)
-
-    sol_amount = trade.get("quote", {}).get("uiAmount", 0)
-    token_amount = trade.get("base", {}).get("uiAmount", 0)
     price_usd = trade.get("tokenPrice")
+
+    # Birdeye sometimes swaps base/quote. Identify SOL by address.
+    quote = trade.get("quote", {})
+    base = trade.get("base", {})
+
+    if quote.get("address") == WSOL_ADDRESS:
+        sol_amount = abs(quote.get("uiAmount", 0))
+        token_amount = abs(base.get("uiAmount", 0))
+    elif base.get("address") == WSOL_ADDRESS:
+        sol_amount = abs(base.get("uiAmount", 0))
+        token_amount = abs(quote.get("uiAmount", 0))
+    else:
+        # Neither is SOL (e.g. token/USDC pair) — use quote as fallback
+        sol_amount = abs(quote.get("uiAmount", 0))
+        token_amount = abs(base.get("uiAmount", 0))
 
     return {
         "tx_signature": trade["txHash"],
@@ -46,7 +61,7 @@ def parse_birdeye_trade(trade: dict, token_mint: str) -> dict:
         "timestamp": ts,
         "side": trade["side"],
         "amount_tokens": token_amount,
-        "amount_sol": abs(sol_amount) if sol_amount else 0,
+        "amount_sol": sol_amount,
         "price_usd": price_usd,
     }
 

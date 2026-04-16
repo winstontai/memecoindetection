@@ -3,6 +3,10 @@
 Run: streamlit run src/dashboard/app.py
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -106,8 +110,7 @@ for ws in scores:
     )
 
     wallet_rows.append({
-        "Wallet": ws.wallet_address[:16] + "...",
-        "Full Address": ws.wallet_address,
+        "Wallet": ws.wallet_address,
         "Score": round(ws.overall_score, 1),
         "Timing": round(ws.timing_score, 1),
         "Profit": round(ws.profit_score, 1),
@@ -121,18 +124,13 @@ for ws in scores:
 
 if wallet_rows:
     df = pd.DataFrame(wallet_rows)
-    st.dataframe(
-        df.drop(columns=["Full Address"]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
     # Wallet detail expander
     st.subheader("Wallet Detail")
     selected_wallet = st.selectbox(
         "Select a wallet to inspect",
-        options=[r["Full Address"] for r in wallet_rows],
-        format_func=lambda x: x[:20] + "...",
+        options=[r["Wallet"] for r in wallet_rows],
     )
 
     if selected_wallet:
@@ -195,7 +193,7 @@ if len(tokens) >= 2:
                 .all()
             )
             overlap_rows.append({
-                "Wallet": row.wallet_address[:20] + "...",
+                "Wallet": row.wallet_address,
                 "Tokens": row.token_count,
                 "Total Buys": row.trade_count,
                 "Total SOL": round(row.total_sol, 2) if row.total_sol else 0,
