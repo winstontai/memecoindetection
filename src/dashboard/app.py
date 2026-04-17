@@ -9,11 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
 from sqlalchemy import func, distinct
 
 from src.db.engine import SessionLocal
-from src.db.models import Token, Wallet, Trade, WalletScore, TokenSignal
+from src.db.models import Token, Wallet, Trade, WalletScore
 
 
 st.set_page_config(page_title="Moonshot Intel", layout="wide")
@@ -29,14 +28,19 @@ db = get_db()
 
 # --- Sidebar ---
 st.sidebar.header("Filters")
-min_score = st.sidebar.slider("Min Wallet Score", 0, 100, 30)
+strict_only = st.sidebar.checkbox("Strict filter only", value=True,
+                                  help="Show only wallets that passed bot + profit/hold filters")
+min_score = st.sidebar.slider("Min Wallet Score", 0, 100, 0)
 
 # --- Overview ---
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Tokens Tracked", db.query(Token).count())
 col2.metric("Total Trades", db.query(Trade).count())
 col3.metric("Unique Wallets", db.query(func.count(distinct(Trade.wallet_address))).scalar())
-col4.metric("Scored Wallets", db.query(WalletScore).filter(WalletScore.overall_score >= min_score).count())
+col4.metric("Strict Wallets",
+            db.query(WalletScore).filter(WalletScore.passes_strict_filter == True).count())
+col5.metric("Bots Filtered",
+            db.query(WalletScore).filter(WalletScore.is_bot == True).count())
 
 st.divider()
 
@@ -77,19 +81,24 @@ st.divider()
 
 # --- Wallet Leaderboard ---
 st.header("Wallet Leaderboard")
-st.caption("Wallets that bought early across multiple tokens, ranked by composite score")
+if strict_only:
+    st.caption("Showing wallets that passed strict filter: non-bot, early buyers who are holding or sold at profit")
+else:
+    st.caption("Showing all scored wallets (includes bots and losing wallets)")
 
-scores = (
+scores_query = (
     db.query(WalletScore)
     .filter(WalletScore.overall_score >= min_score)
     .order_by(WalletScore.overall_score.desc())
     .limit(50)
-    .all()
 )
+if strict_only:
+    scores_query = scores_query.filter(WalletScore.passes_strict_filter == True)
+
+scores = scores_query.all()
 
 wallet_rows = []
 for ws in scores:
-    # Get per-token breakdown
     token_symbols = (
         db.query(distinct(Token.symbol))
         .join(Trade, Trade.token_mint == Token.mint_address)
@@ -98,35 +107,25 @@ for ws in scores:
     )
     tokens_str = ", ".join(s[0] for s in token_symbols if s[0])
 
-    total_sol_in = (
-        db.query(func.sum(Trade.amount_sol))
-        .filter(Trade.wallet_address == ws.wallet_address, Trade.side == "buy")
-        .scalar() or 0
-    )
-    total_sol_out = (
-        db.query(func.sum(Trade.amount_sol))
-        .filter(Trade.wallet_address == ws.wallet_address, Trade.side == "sell")
-        .scalar() or 0
-    )
-
     wallet_rows.append({
         "Wallet": ws.wallet_address,
         "Score": round(ws.overall_score, 1),
         "Timing": round(ws.timing_score, 1),
-        "Profit": round(ws.profit_score, 1),
-        "Frequency": round(ws.frequency_score, 1),
-        "Consistency": round(ws.consistency_score, 1),
-        "Tokens": tokens_str,
-        "SOL In": round(total_sol_in, 2),
-        "SOL Out": round(total_sol_out, 2),
+        "Profit": ws.tokens_profitable,
+        "Hold": ws.tokens_holding,
+        "Loss": ws.tokens_at_loss,
+        "SOL P/L": round(ws.realized_profit_sol or 0, 3),
         "# Tokens": ws.tokens_analyzed,
+        "Tokens": tokens_str,
+        "Bot?": "Y" if ws.is_bot else "",
+        "Total TX": ws.total_trades,
     })
 
 if wallet_rows:
     df = pd.DataFrame(wallet_rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    # Wallet detail expander
+    # Wallet detail
     st.subheader("Wallet Detail")
     selected_wallet = st.selectbox(
         "Select a wallet to inspect",
@@ -134,6 +133,28 @@ if wallet_rows:
     )
 
     if selected_wallet:
+        ws = db.query(WalletScore).filter(WalletScore.wallet_address == selected_wallet).first()
+
+        # Per-token outcome breakdown
+        if ws and ws.outcome_summary:
+            st.markdown("**Per-token Outcome**")
+            outcome_rows = []
+            for mint, outcome in ws.outcome_summary.items():
+                token = db.get(Token, mint)
+                outcome_rows.append({
+                    "Token": token.symbol if token else mint[:8],
+                    "Status": outcome.get("status", "?"),
+                    "Bought (tokens)": round(outcome.get("tokens_bought", 0), 2),
+                    "Sold (tokens)": round(outcome.get("tokens_sold", 0), 2),
+                    "Remaining": round(outcome.get("tokens_remaining", 0), 2),
+                    "SOL Spent": round(outcome.get("sol_spent", 0), 4),
+                    "SOL Received": round(outcome.get("sol_received", 0), 4),
+                    "Realized P/L (SOL)": round(outcome.get("realized_profit_sol", 0), 4),
+                })
+            st.dataframe(pd.DataFrame(outcome_rows), use_container_width=True, hide_index=True)
+
+        # All trades for this wallet
+        st.markdown("**All Trades**")
         trades = (
             db.query(Trade)
             .filter(Trade.wallet_address == selected_wallet)
@@ -158,16 +179,16 @@ if wallet_rows:
 
         st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
 else:
-    st.info("No wallets found above the minimum score threshold.")
+    st.info("No wallets match the current filters.")
 
 st.divider()
 
 # --- Early Buyer Overlap ---
 st.header("Cross-Token Wallet Overlap")
-st.caption("Wallets that appear as early buyers in multiple tokens")
+st.caption("Wallets that appear as early buyers in multiple tokens (respects strict filter toggle)")
 
 if len(tokens) >= 2:
-    overlap_data = (
+    overlap_q = (
         db.query(
             Trade.wallet_address,
             func.count(distinct(Trade.token_mint)).label("token_count"),
@@ -178,14 +199,20 @@ if len(tokens) >= 2:
         .group_by(Trade.wallet_address)
         .having(func.count(distinct(Trade.token_mint)) >= 2)
         .order_by(func.count(distinct(Trade.token_mint)).desc(), func.sum(Trade.amount_sol).desc())
-        .limit(30)
-        .all()
     )
+
+    if strict_only:
+        strict_wallets = {
+            row[0] for row in
+            db.query(WalletScore.wallet_address).filter(WalletScore.passes_strict_filter == True).all()
+        }
+        overlap_data = [r for r in overlap_q.limit(500).all() if r.wallet_address in strict_wallets][:30]
+    else:
+        overlap_data = overlap_q.limit(30).all()
 
     if overlap_data:
         overlap_rows = []
         for row in overlap_data:
-            # Get which tokens
             syms = (
                 db.query(distinct(Token.symbol))
                 .join(Trade, Trade.token_mint == Token.mint_address)
@@ -201,4 +228,4 @@ if len(tokens) >= 2:
             })
         st.dataframe(pd.DataFrame(overlap_rows), use_container_width=True, hide_index=True)
     else:
-        st.info("No cross-token overlap found.")
+        st.info("No cross-token overlap found with current filters.")

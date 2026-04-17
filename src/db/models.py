@@ -122,6 +122,21 @@ class WalletScore(Base):
     tokens_analyzed = Column(Integer, default=0)
     scored_at = Column(DateTime, default=datetime.utcnow)
 
+    # Bot detection
+    is_bot = Column(Boolean, default=False)
+    total_trades = Column(Integer, default=0)
+    dust_trade_ratio = Column(Float)
+
+    # Profit/hold classification
+    tokens_profitable = Column(Integer, default=0)
+    tokens_holding = Column(Integer, default=0)
+    tokens_at_loss = Column(Integer, default=0)
+    realized_profit_sol = Column(Float, default=0.0)
+    outcome_summary = Column(JSON)  # Per-token: {mint: {status, sol_spent, sol_received, ...}}
+
+    # Strict filter result
+    passes_strict_filter = Column(Boolean, default=False)
+
     wallet = relationship("Wallet", back_populates="scores")
 
     __table_args__ = (
